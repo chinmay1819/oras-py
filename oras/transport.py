@@ -105,6 +105,20 @@ class Transport:
         self.session.close()
 
 
+def response_reason(response) -> str:
+    """
+    Get the status line reason of a response.
+
+    requests calls this `reason` and httpx calls it `reason_phrase`, so this is
+    read defensively. It is the one place shared code has to account for the
+    two HTTP clients differing.
+
+    :param response: a response to read the reason from
+    """
+    reason = getattr(response, "reason", None) or getattr(response, "reason_phrase", "")
+    return str(reason or "")
+
+
 def successful_response(status_code: int = 200) -> requests.Response:
     """
     Create a response for an interaction that did not need to hit the registry.
