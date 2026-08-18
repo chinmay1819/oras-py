@@ -7,6 +7,8 @@ one, which is the point of keeping request execution behind a small interface.
 
 import requests
 
+import oras.auth
+import oras.auth.utils as auth_utils
 import oras.defaults
 import oras.provider
 from oras.transport import Transport, successful_response
@@ -46,7 +48,14 @@ class FakeTransport:
         self.responses = list(responses or [])
 
     def request(
-        self, url, method="GET", data=None, headers=None, json=None, stream=False
+        self,
+        url,
+        method="GET",
+        data=None,
+        headers=None,
+        json=None,
+        stream=False,
+        params=None,
     ):
         self.calls.append(
             {
@@ -56,6 +65,7 @@ class FakeTransport:
                 "headers": headers,
                 "json": json,
                 "stream": stream,
+                "params": params,
             }
         )
         if self.responses:
@@ -256,3 +266,167 @@ def test_upload_manifest_content_by_reference():
         call["url"]
         == f"http://registry.example/v2/dinosaur/artifact/manifests/{digest}"
     )
+
+
+def test_transport_forwards_query_parameters():
+    """
+    Token requests need query parameters, so the transport has to carry them.
+    """
+    session = FakeSession()
+    transport = Transport(session=session)
+
+    transport.request(
+        "https://auth.example/token",
+        params={"service": "registry.example", "scope": "repository:demo:pull"},
+    )
+
+    assert session.calls[0]["params"] == {
+        "service": "registry.example",
+        "scope": "repository:demo:pull",
+    }
+
+
+def test_transport_streams_without_reading_the_body():
+    session = FakeSession()
+    transport = Transport(session=session)
+
+    transport.request("https://registry.example/v2/repo/blobs/sha256:abc", stream=True)
+
+    assert session.calls[0]["stream"] is True
+
+
+def test_transport_passes_file_objects_through_unread(tmp_path):
+    """
+    A file object must reach requests as-is, so uploads are not buffered here.
+    """
+    blob = tmp_path / "blob.bin"
+    blob.write_bytes(b"some payload")
+
+    session = FakeSession()
+    transport = Transport(session=session)
+
+    with open(blob, "rb") as handle:
+        transport.request("https://registry.example/upload", "PUT", data=handle)
+        sent = session.calls[0]["data"]
+
+        # The very same handle is handed over, still unread
+        assert sent is handle
+        assert sent.tell() == 0
+
+
+def test_transport_close_closes_the_session():
+    closed = []
+
+    class ClosableSession(FakeSession):
+        def close(self):
+            closed.append(True)
+
+    transport = Transport(session=ClosableSession())
+    transport.close()
+
+    assert closed == [True]
+
+
+def test_registry_accepts_an_injected_transport():
+    transport = FakeTransport()
+    registry = oras.provider.Registry(
+        hostname="registry.example", insecure=True, transport=transport
+    )
+
+    assert registry.transport is transport
+    # The auth backend is given the same one, so connections are shared
+    assert registry.auth.transport is transport
+
+
+def test_registry_builds_a_transport_when_none_is_given():
+    registry = oras.provider.Registry(hostname="registry.example", tls_verify=False)
+
+    assert isinstance(registry.transport, Transport)
+    assert registry.transport.tls_verify is False
+    assert registry.auth.transport is registry.transport
+
+
+def test_registry_close_closes_the_transport():
+    closed = []
+
+    class ClosableTransport(FakeTransport):
+        def close(self):
+            closed.append(True)
+
+    registry = get_registry(ClosableTransport())
+    registry.close()
+
+    assert closed == [True]
+
+
+def test_get_auth_backend_still_accepts_a_session():
+    """
+    The older way of wiring a backend keeps working.
+    """
+    session = requests.Session()
+    backend = oras.auth.get_auth_backend("token", session, insecure=True)
+
+    assert backend.session is session
+    assert backend.prefix == "http"
+
+
+def test_auth_backend_tls_verify_reads_the_transport():
+    backend = oras.auth.get_auth_backend("token", tls_verify=False)
+
+    assert backend._tls_verify is False
+    assert backend.transport.tls_verify is False
+
+
+def token_response(payload: bytes = b'{"token": "a-token"}'):
+    return make_response(content=payload)
+
+
+def test_token_request_goes_through_the_transport():
+    """
+    Requesting a bearer token is an HTTP call like any other, so it uses the
+    transport rather than reaching for a session of its own.
+    """
+    transport = FakeTransport([token_response()])
+    backend = oras.auth.get_auth_backend("token", transport=transport)
+    backend.set_basic_auth("myuser", "mypass")
+
+    header = auth_utils.parse_auth_header(
+        'Bearer realm="https://auth.example/token",'
+        'service="registry.example",scope="repository:demo:pull"'
+    )
+    token = backend.request_token(header)
+
+    assert token == "a-token"
+    (call,) = transport.calls
+    assert call["method"] == "GET"
+    assert call["url"] == "https://auth.example/token"
+    assert call["params"] == {
+        "service": "registry.example",
+        "scope": "repository:demo:pull",
+    }
+    assert call["headers"]["Authorization"].startswith("Basic ")
+    assert call["headers"]["Service"] == "registry.example"
+
+
+def test_anonymous_token_request_goes_through_the_transport():
+    transport = FakeTransport([token_response(b'{"access_token": "anon"}')])
+    backend = oras.auth.get_auth_backend("token", transport=transport)
+
+    header = auth_utils.parse_auth_header(
+        'Bearer realm="https://auth.example/token",service="registry.example"'
+    )
+    token = backend.request_anonymous_token(header)
+
+    assert token == "anon"
+    (call,) = transport.calls
+    assert call["url"] == "https://auth.example/token"
+    assert call["params"] == {"service": "registry.example"}
+
+
+def test_token_request_returns_nothing_when_refused():
+    transport = FakeTransport([make_response(401, content=b"{}")])
+    backend = oras.auth.get_auth_backend("token", transport=transport)
+
+    header = auth_utils.parse_auth_header('Bearer realm="https://auth.example/token"')
+
+    assert backend.request_token(header) is None

@@ -136,7 +136,7 @@ class TokenAuth(AuthBackend):
         logger.debug(
             f"Requesting auth token for: {h} with header keys: {list(headers.keys())}"
         )
-        authResponse = self.session.get(h.realm, headers=headers, params=params, verify=self._tls_verify)  # type: ignore
+        authResponse = self.transport.request(h.realm, "GET", headers=headers, params=params)  # type: ignore
 
         if authResponse.status_code != 200:
             logger.debug(f"Auth response was not successful: {authResponse.text}")
@@ -163,9 +163,7 @@ class TokenAuth(AuthBackend):
             params["scope"] = h.scope
 
         logger.debug(f"Requesting anon token with params: {params}")
-        response = self.session.request(
-            "GET", h.realm, params=params, verify=self._tls_verify
-        )
+        response = self.transport.request(h.realm, "GET", params=params)  # type: ignore
         if response.status_code != 200:
             logger.debug(f"Response for anon token failed: {response.text}")
             return
