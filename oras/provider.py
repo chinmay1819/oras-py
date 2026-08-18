@@ -8,7 +8,6 @@ import sys
 import urllib
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
-from http.cookiejar import DefaultCookiePolicy
 from tempfile import TemporaryDirectory
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
@@ -24,6 +23,7 @@ import oras.oci
 import oras.schemas
 import oras.utils
 from oras.logger import logger
+from oras.transport import Transport, successful_response
 from oras.types import container_type
 from oras.utils.fileio import PathAndOptionalContent
 
@@ -67,28 +67,52 @@ class Registry:
         """
         self.hostname: Optional[str] = hostname
         self.headers: dict = {}
-        self.session: requests.Session = requests.Session()
         self.prefix: str = "http" if insecure else "https"
-        self._tls_verify = tls_verify
 
-        if not tls_verify:
-            requests.packages.urllib3.disable_warnings()  # type: ignore
-
-        # Ignore all cookies: some registries try to set one
-        # and take it as a sign they are talking to a browser,
-        # trying to set further CSRF cookies (Harbor is such a case)
-        self.session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+        # The transport owns the session and how requests are sent
+        self.transport = Transport(tls_verify=tls_verify)
 
         # Get custom backend, pass on session to share
         self.auth = oras.auth.get_auth_backend(
             auth_backend, self.session, insecure, tls_verify=tls_verify
         )
 
+    @property
+    def session(self) -> requests.Session:
+        """
+        The session used to interact with the registry.
+        """
+        return self.transport.session
+
+    @session.setter
+    def session(self, session: requests.Session):
+        self.transport.session = session
+
+    @property
+    def _tls_verify(self) -> Union[bool, str]:
+        """
+        Whether tls verification is enabled, or the custom CA-Bundle in use.
+        """
+        return self.transport.tls_verify
+
+    @_tls_verify.setter
+    def _tls_verify(self, tls_verify: Union[bool, str]):
+        self.transport.tls_verify = tls_verify
+
     def __repr__(self) -> str:
         return str(self)
 
     def __str__(self) -> str:
         return "[oras-client]"
+
+    def _url(self, path: str) -> str:
+        """
+        Prefix a registry path (e.g., from a Container) with the scheme in use.
+
+        :param path: the registry path, without a scheme
+        :type path: str
+        """
+        return f"{self.prefix}://{path}"
 
     def version(self, return_items: bool = False) -> Union[dict, str]:
         """
@@ -280,9 +304,7 @@ class Registry:
 
         if self.blob_exists(layer, container):
             logger.debug(f'layer already exists: {layer["digest"]}')
-            response = requests.Response()
-            response.status_code = 200
-            return response
+            return successful_response()
 
         # Chunked for large, otherwise POST and PUT
         # This is currently disabled unless the user asks for it, as
@@ -302,8 +324,7 @@ class Registry:
             response.status_code not in [200, 201, 202]
             and layer["digest"] == oras.defaults.blank_hash
         ):
-            response = requests.Response()
-            response.status_code = 200
+            response = successful_response()
         return response
 
     @decorator.ensure_container
@@ -318,7 +339,7 @@ class Registry:
         """
         logger.debug(f"Deleting tag {tag} for {container}")
 
-        head_url = f"{self.prefix}://{container.manifest_url(tag)}"  # type: ignore
+        head_url = self._url(container.manifest_url(tag))  # type: ignore
 
         # get digest of manifest to delete
         response = self.do_request(
@@ -334,7 +355,7 @@ class Registry:
         if not digest:
             raise RuntimeError("Expected to find Docker-Content-Digest header.")
 
-        delete_url = f"{self.prefix}://{container.manifest_url(digest)}"  # type: ignore
+        delete_url = self._url(container.manifest_url(digest))  # type: ignore
         response = self.do_request(delete_url, "DELETE")
         if response.status_code != 202:
             raise RuntimeError(f"Delete was not successful: {response.json()}")
@@ -351,7 +372,7 @@ class Registry:
         :type N: Optional[int]
         """
         retrieve_all = N is None
-        tags_url = f"{self.prefix}://{container.tags_url(N=N)}"  # type: ignore
+        tags_url = self._url(container.tags_url(N=N))  # type: ignore
         tags: List[str] = []
 
         def extract_tags(response: requests.Response):
@@ -425,7 +446,7 @@ class Registry:
         :type head: bool
         """
         method = "GET" if not head else "HEAD"
-        blob_url = f"{self.prefix}://{container.get_blob_url(digest)}"  # type: ignore
+        blob_url = self._url(container.get_blob_url(digest))  # type: ignore
         return self.do_request(blob_url, method, headers=self.headers, stream=stream)
 
     def get_container(self, name: container_type) -> oras.container.Container:
@@ -533,15 +554,9 @@ class Registry:
         :type layer: dict
         """
         # Start an upload session
-        headers = {"Content-Type": "application/octet-stream"}
-
-        upload_url = f"{self.prefix}://{container.upload_blob_url()}"
-        r = self.do_request(upload_url, "POST", headers=headers)
-
-        # Location should be in the header
-        session_url = self._get_location(r, container)
-        if not session_url:
-            raise ValueError(f"Issue retrieving session url: {r.json()}")
+        session_url = self._start_upload_session(
+            container, {"Content-Type": "application/octet-stream"}
+        )
 
         # PUT to upload blob url
         headers = {
@@ -571,7 +586,7 @@ class Registry:
         :type container: oras.container.Container
         """
         blob_url = container.get_blob_url(layer["digest"])
-        response = self.do_request(f"{self.prefix}://{blob_url}", "HEAD")
+        response = self.do_request(self._url(blob_url), "HEAD")
         return response.status_code == 200
 
     def _get_location(
@@ -600,6 +615,39 @@ class Registry:
             session_url = f"{prefix}{session_url}"
         return session_url
 
+    def _require_location(
+        self, r: requests.Response, container: oras.container.Container
+    ) -> str:
+        """
+        Parse the location header, and require that one was provided.
+
+        :param r: requests response with headers
+        :type r: requests.Response
+        :param container:  parsed container URI
+        :type container: oras.container.Container
+        """
+        session_url = self._get_location(r, container)
+        if not session_url:
+            raise ValueError(f"Issue retrieving session url: {r.json()}")
+        return session_url
+
+    def _start_upload_session(
+        self, container: oras.container.Container, headers: dict
+    ) -> str:
+        """
+        Open a blob upload session and return the url to upload to.
+
+        :param container:  parsed container URI
+        :type container: oras.container.Container
+        :param headers: headers to start the session with
+        :type headers: dict
+        """
+        upload_url = self._url(container.upload_blob_url())
+        r = self.do_request(upload_url, "POST", headers=headers)
+
+        # Location should be in the header
+        return self._require_location(r, container)
+
     def chunked_upload(
         self,
         blob: str,
@@ -622,14 +670,7 @@ class Registry:
         # Start an upload session
         headers = {"Content-Type": "application/octet-stream", "Content-Length": "0"}
         headers.update(self.headers)
-
-        upload_url = f"{self.prefix}://{container.upload_blob_url()}"
-        r = self.do_request(upload_url, "POST", headers=headers)
-
-        # Location should be in the header
-        session_url = self._get_location(r, container)
-        if not session_url:
-            raise ValueError(f"Issue retrieving session url: {r.json()}")
+        session_url = self._start_upload_session(container, headers)
 
         # Read the blob in chunks, for each do a patch
         start = 0
@@ -652,9 +693,7 @@ class Registry:
                         session_url, "PATCH", data=chunk, headers=headers
                     )
                 )
-                session_url = self._get_location(r, container)
-                if not session_url:
-                    raise ValueError(f"Issue retrieving session url: {r.json()}")
+                session_url = self._require_location(r, container)
 
         # Finally, issue a PUT request to close blob
         session_url = oras.utils.append_url_params(
@@ -706,10 +745,42 @@ class Registry:
             "Content-Type": oras.defaults.default_manifest_media_type,
         }
         return self.do_request(
-            f"{self.prefix}://{container.manifest_url()}",  # noqa
+            self._url(container.manifest_url()),  # noqa
             "PUT",
             headers=headers,
             json=manifest,
+        )
+
+    def upload_manifest_content(
+        self,
+        content: bytes,
+        container: oras.container.Container,
+        media_type: str,
+        reference: Optional[str] = None,
+    ) -> requests.Response:
+        """
+        Upload a manifest from the exact bytes it should be stored as.
+
+        Unlike upload_manifest, the content is sent verbatim rather than being
+        serialized from a dict, so the digest of what the registry stores is the
+        digest of what was handed over. This matters when the manifest was
+        produced elsewhere, for example when copying from an OCI layout.
+
+        :param content: the raw manifest (or index) bytes to upload
+        :type content: bytes
+        :param container:  parsed container URI
+        :type container: oras.container.Container
+        :param media_type: media type of the manifest, used as the Content-Type
+        :type media_type: str
+        :param reference: tag or digest to upload to, defaults to the container reference
+        :type reference: str
+        """
+        headers = {"Content-Type": media_type}
+        return self.do_request(
+            self._url(container.manifest_url(reference)),
+            "PUT",
+            headers=headers,
+            data=content,
         )
 
     def push(
@@ -937,6 +1008,40 @@ class Registry:
         return files
 
     @decorator.ensure_container
+    def get_manifest_content(
+        self,
+        container: container_type,
+        allowed_media_type: Optional[list] = None,
+        reference: Optional[str] = None,
+    ) -> Tuple[bytes, Optional[str]]:
+        """
+        Retrieve a manifest as the raw bytes the registry served, with its digest.
+
+        get_manifest parses the manifest into a dict, which is what most callers
+        want. Use this instead when the bytes themselves matter - re-serializing
+        a parsed manifest can change its digest - such as when storing a manifest
+        in an OCI layout.
+
+        :param container:  parsed container URI
+        :type container: oras.container.Container or str
+        :param allowed_media_type: one or more allowed media types
+        :type allowed_media_type: list
+        :param reference: tag or digest to retrieve, defaults to the container reference
+        :type reference: str
+        :return: tuple of the raw manifest bytes, and the digest reported by the
+                 registry in the Docker-Content-Digest header (None if absent)
+        """
+        if not allowed_media_type:
+            allowed_media_type = oras.defaults.default_manifest_accepted_media_types
+        headers = {"Accept": ", ".join(allowed_media_type)}
+
+        manifest_url = self._url(container.manifest_url(reference))  # type: ignore
+        response = self.do_request(manifest_url, "GET", headers=headers)
+
+        self._check_200_response(response)
+        return response.content, response.headers.get("Docker-Content-Digest")
+
+    @decorator.ensure_container
     def get_manifest(
         self,
         container: container_type,
@@ -961,7 +1066,7 @@ class Registry:
             allowed_media_type = oras.defaults.default_manifest_accepted_media_types
         headers = {"Accept": ", ".join(allowed_media_type)}
 
-        get_manifest = f"{self.prefix}://{container.manifest_url()}"  # type: ignore
+        get_manifest = self._url(container.manifest_url())  # type: ignore
         response = self.do_request(get_manifest, "GET", headers=headers)
 
         self._check_200_response(response)
@@ -1002,14 +1107,8 @@ class Registry:
         # Make the request and return to calling function, but attempt to use auth token if previously obtained
         if isinstance(self.auth, oras.auth.TokenAuth) and self.auth.token is not None:
             headers.update(self.auth.get_auth_header())
-        response = self.session.request(
-            method,
-            url,
-            data=data,
-            json=json,
-            headers=headers,
-            stream=stream,
-            verify=self._tls_verify,
+        response = self.transport.request(
+            url, method, data=data, headers=headers, json=json, stream=stream
         )
 
         # A 401 response is a request for authentication, 404 is not found
@@ -1020,14 +1119,8 @@ class Registry:
         headers, changed = self.auth.authenticate_request(response, headers)
         if not changed:
             raise ValueError("Cannot respond to request for authentication.")
-        response = self.session.request(
-            method,
-            url,
-            data=data,
-            json=json,
-            headers=headers,
-            stream=stream,
-            verify=self._tls_verify,
+        response = self.transport.request(
+            url, method, data=data, headers=headers, json=json, stream=stream
         )
 
         # One retry if 403 denied (need new token?)
@@ -1035,14 +1128,8 @@ class Registry:
             headers, changed = self.auth.authenticate_request(
                 response, headers, refresh=True
             )
-            response = self.session.request(
-                method,
-                url,
-                data=data,
-                json=json,
-                headers=headers,
-                stream=stream,
-                verify=self._tls_verify,
+            response = self.transport.request(
+                url, method, data=data, headers=headers, json=json, stream=stream
             )
 
         return response

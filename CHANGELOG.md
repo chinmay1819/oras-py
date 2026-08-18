@@ -14,6 +14,7 @@ and **Merged pull requests**. Critical items to know are:
 The versions coincide with releases on pip. Only major versions will be released as tags on Github.
 
 ## [0.0.x](https://github.com/oras-project/oras-py/tree/main) (0.0.x)
+ - move request execution behind an `oras.transport.Transport`, and add `get_manifest_content`/`upload_manifest_content` so `Layout` uses registry operations instead of raw requests (0.2.44)
  - route push completion output through the logger and support the documented `quiet` option, closes issue [229](https://github.com/oras-project/oras-py/issues/229) (0.2.43)
  - add Layout `copy` for pull_from_registry capability (0.2.42)
  - make `get_manifest()` validation optional, fix `Accept` header join, and expand default `Accept` header types to cover all supported response types for the `/v2/<name>/manifests/<reference>` endpoint (0.2.41)
