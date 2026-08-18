@@ -1,16 +1,26 @@
 """
 HTTP transport for registry interactions.
 
-This module is the only place where requests are actually sent to a registry.
-Keeping execution behind a small boundary means that the rest of the SDK deals
-with urls, headers and responses, and never with session or TLS handling.
+This module is the only place where requests are actually sent to a registry,
+whether they come from the provider or from an authentication backend.
+
+The transport owns the connection: the session, TLS verification and cookie
+policy. It deliberately does not own anything above HTTP. It knows nothing
+about manifests, blobs, digests or media types, it does not decide when a
+request should be authenticated, and it does not decide when one should be
+retried. Those are registry concerns, and they stay in
+:class:`oras.provider.Registry`.
+
+Keeping execution in one small place is also what makes a different execution
+model possible later: an alternative transport only has to send a request and
+return a response, without any registry logic being written a second time.
 """
 
 __copyright__ = "Copyright The ORAS Authors."
 __license__ = "Apache-2.0"
 
 from http.cookiejar import DefaultCookiePolicy
-from typing import Optional, Union
+from typing import IO, Optional, Union
 
 import requests
 
@@ -48,10 +58,11 @@ class Transport:
         self,
         url: str,
         method: str = "GET",
-        data: Optional[Union[dict, bytes]] = None,
+        data: Optional[Union[dict, bytes, IO]] = None,
         headers: Optional[dict] = None,
         json: Optional[dict] = None,
         stream: bool = False,
+        params: Optional[dict] = None,
     ) -> requests.Response:
         """
         Send a single request, without any authentication or retry handling.
@@ -60,14 +71,17 @@ class Transport:
         :type url: str
         :param method: the method to use (GET, DELETE, POST, PUT, PATCH)
         :type method: str
-        :param data: data for requests
-        :type data: dict or bytes
+        :param data: body for the request. A file object or iterator is sent
+                     without being read into memory first
+        :type data: dict or bytes or IO
         :param headers: headers for the request
         :type headers: dict
         :param json: json data for requests
         :type json: dict
-        :param stream: stream the responses
+        :param stream: stream the response instead of downloading it at once
         :type stream: bool
+        :param params: query string parameters to add to the url
+        :type params: dict
         """
         return self.session.request(
             method,
@@ -76,8 +90,19 @@ class Transport:
             json=json,
             headers=headers,
             stream=stream,
+            params=params,
             verify=self.tls_verify,
         )
+
+    def close(self):
+        """
+        Release the underlying connections.
+
+        Calling this is optional. It is offered for callers that create many
+        short lived clients and do not want to wait for garbage collection to
+        close the pooled connections.
+        """
+        self.session.close()
 
 
 def successful_response(status_code: int = 200) -> requests.Response:

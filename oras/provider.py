@@ -50,6 +50,7 @@ class Registry:
         insecure: bool = False,
         tls_verify: Union[bool, str] = True,
         auth_backend: str = "token",
+        transport: Optional[Transport] = None,
     ):
         """
         Create an ORAS client.
@@ -64,17 +65,22 @@ class Registry:
         :type tls_verify: bool
         :param auth_backend: name of the auth backend to use
         :type auth_backend: str
+        :param transport: how to send requests, defaults to a new transport
+                          configured with tls_verify. A provided transport is
+                          used as given, so it carries its own tls settings
+        :type transport: oras.transport.Transport
         """
         self.hostname: Optional[str] = hostname
         self.headers: dict = {}
         self.prefix: str = "http" if insecure else "https"
 
         # The transport owns the session and how requests are sent
-        self.transport = Transport(tls_verify=tls_verify)
+        self.transport = transport or Transport(tls_verify=tls_verify)
 
-        # Get custom backend, pass on session to share
+        # The auth backend shares the transport, so a token request and a
+        # registry request reuse the same connections
         self.auth = oras.auth.get_auth_backend(
-            auth_backend, self.session, insecure, tls_verify=tls_verify
+            auth_backend, insecure=insecure, transport=self.transport
         )
 
     @property
@@ -98,6 +104,16 @@ class Registry:
     @_tls_verify.setter
     def _tls_verify(self, tls_verify: Union[bool, str]):
         self.transport.tls_verify = tls_verify
+
+    def close(self):
+        """
+        Release the connections held by the transport.
+
+        Calling this is optional, and a client is not required to be used as a
+        context manager. It is here for callers that create many clients and
+        want the pooled connections closed promptly.
+        """
+        self.transport.close()
 
     def __repr__(self) -> str:
         return str(self)
