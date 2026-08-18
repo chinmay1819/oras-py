@@ -58,6 +58,37 @@ class AuthBackend:
     def get_auth_header(self):
         raise NotImplementedError
 
+    def authenticate_request(self, original, headers: dict, refresh: bool = False):
+        """
+        Answer an authentication challenge. Backends decide how.
+
+        :param original: original response carrying the challenge
+        :param headers: headers of the request to retry
+        :type headers: dict
+        :param refresh: discard a cached token first
+        :type refresh: bool
+        """
+        raise NotImplementedError
+
+    async def authenticate_request_async(
+        self, original, headers: dict, refresh: bool = False
+    ):
+        """
+        Answer an authentication challenge for an asynchronous request.
+
+        The default is to reuse the synchronous answer, which is correct for
+        any backend that decides locally and sends no request of its own.
+        Backends that do talk to a token endpoint override this so the call is
+        awaited rather than blocking the event loop.
+
+        :param original: original response carrying the challenge
+        :param headers: headers of the request to retry
+        :type headers: dict
+        :param refresh: discard a cached token first
+        :type refresh: bool
+        """
+        return self.authenticate_request(original, headers, refresh)
+
     def get_container(self, name: container_type) -> oras.container.Container:
         """
         Courtesy function to get a container from a URI.
