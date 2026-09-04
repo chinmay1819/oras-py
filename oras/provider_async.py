@@ -15,9 +15,10 @@ a change to how a request is carried out belongs in a transport.
 __copyright__ = "Copyright The ORAS Authors."
 __license__ = "Apache-2.0"
 
+import asyncio
 import os
 import urllib
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import jsonschema
@@ -35,6 +36,11 @@ from oras.types import container_type
 
 if TYPE_CHECKING:
     import httpx
+
+# A download streams rather than going through do_request, so it carries the
+# same retry policy here instead of inheriting the decorator's.
+DOWNLOAD_ATTEMPTS = 5
+DOWNLOAD_TIMEOUT = 2
 
 
 class AsyncRegistry(RegistryBase):
@@ -166,6 +172,70 @@ class AsyncRegistry(RegistryBase):
 
         return response
 
+    @asynccontextmanager
+    async def stream_request(
+        self,
+        url: str,
+        method: str = "GET",
+        headers: Optional[dict] = None,
+        params: Optional[dict] = None,
+    ):
+        """
+        Send a request and yield the response with its body still unread.
+
+        This is the streaming counterpart to do_request, and answers an
+        authentication challenge the same way: once, then once more with a
+        refreshed token if the retry is still refused. do_request itself
+        cannot be used here because it returns a response whose body has
+        already been read, which is the thing a download must avoid.
+
+        :param url: the URL to issue the request to
+        :type url: str
+        :param method: the method to use
+        :type method: str
+        :param headers: headers for the request
+        :type headers: dict
+        :param params: query string parameters to add to the url
+        :type params: dict
+        """
+        headers = dict(headers or {})
+        if isinstance(self.auth, oras.auth.TokenAuth) and self.auth.token is not None:
+            headers.update(self.auth.get_auth_header())
+
+        async def open_stream(request_headers):
+            stream = self.transport.stream(
+                url, method, headers=request_headers, params=params
+            )
+            return stream, await stream.__aenter__()
+
+        stream, response = await open_stream(headers)
+        try:
+            # The challenge is in the headers, so it can be read without
+            # touching the body; the stream is closed and opened again rather
+            # than replayed.
+            if response.status_code in [401, 403]:
+                headers, changed = await self.auth.authenticate_request_async(
+                    response, headers
+                )
+                if not changed:
+                    raise ValueError("Cannot respond to request for authentication.")
+                await stream.__aexit__(None, None, None)
+                stream, response = await open_stream(headers)
+
+                # One retry if 403 denied (need new token?). As in do_request,
+                # the refreshed answer is tried whether or not the backend says
+                # it changed anything.
+                if response.status_code == 403:
+                    headers, changed = await self.auth.authenticate_request_async(
+                        response, headers, refresh=True
+                    )
+                    await stream.__aexit__(None, None, None)
+                    stream, response = await open_stream(headers)
+
+            yield response
+        finally:
+            await stream.__aexit__(None, None, None)
+
     async def _do_paginated_request(
         self, url: str, callable: Callable[["httpx.Response"], bool]
     ):
@@ -295,32 +365,42 @@ class AsyncRegistry(RegistryBase):
         :type outfile: str
         """
         httpx_module = get_httpx()
-        try:
-            outdir = os.path.dirname(outfile)
-            if outdir and not os.path.exists(outdir):
-                oras.utils.mkdir_p(outdir)
+        blob_url = self._url(container.get_blob_url(digest))  # type: ignore
 
-            blob_url = self._url(container.get_blob_url(digest))  # type: ignore
-            headers = dict(self.headers)
-            if (
-                isinstance(self.auth, oras.auth.TokenAuth)
-                and self.auth.token is not None
-            ):
-                headers.update(self.auth.get_auth_header())
+        attempt = 0
+        while True:
+            try:
+                outdir = os.path.dirname(outfile)
+                if outdir and not os.path.exists(outdir):
+                    oras.utils.mkdir_p(outdir)
 
-            async with self.transport.stream(blob_url, "GET", headers=headers) as r:
-                r.raise_for_status()
-                with open(outfile, "wb") as f:
-                    async for chunk in r.aiter_bytes(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
+                async with self.stream_request(
+                    blob_url, "GET", headers=self.headers
+                ) as r:
+                    r.raise_for_status()
 
-        # Allow an empty layer to fail and return /dev/null
-        except (httpx_module.HTTPError, OSError) as e:
-            if digest == oras.defaults.blank_hash:
-                return os.devnull
-            raise e
-        return outfile
+                    # opened inside the attempt so a retry starts a fresh file
+                    with open(outfile, "wb") as f:
+                        async for chunk in r.aiter_bytes(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                return outfile
+
+            # Allow an empty layer to fail and return /dev/null
+            except (httpx_module.HTTPError, OSError) as e:
+                if digest == oras.defaults.blank_hash:
+                    return os.devnull
+
+                # Only a failed connection is worth another go. A status the
+                # registry meant, a 404 say, will say the same thing again.
+                if not isinstance(e, httpx_module.TransportError):
+                    raise
+                attempt += 1
+                if attempt >= DOWNLOAD_ATTEMPTS:
+                    raise
+                sleep = decorator.backoff_seconds(attempt - 1, DOWNLOAD_TIMEOUT)
+                logger.info(f"Retrying in {sleep} seconds - error: {e}")
+                await asyncio.sleep(sleep)
 
     async def _start_upload_session(self, container, headers: dict) -> str:
         """

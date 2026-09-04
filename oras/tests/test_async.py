@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import os
 import pathlib
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -676,3 +677,151 @@ async def test_streamed_body_survives_a_redirect():
 
 async def iter_bytes(payload: bytes):
     yield payload
+
+
+# ---------------------------------------------------------------- streamed auth
+
+
+class StreamingTransport(FakeAsyncTransport):
+    """
+    A transport whose stream() can be told what to answer with.
+
+    Records the headers of every stream that is opened, which is how the
+    authentication of a download is checked.
+    """
+
+    def __init__(self, statuses=None, transport_errors=0):
+        super().__init__()
+        self.statuses = list(statuses or [200])
+        self.opened = []
+        self.transport_errors = transport_errors
+
+    @asynccontextmanager
+    async def stream(self, url, method="GET", headers=None, params=None):
+        self.opened.append(dict(headers or {}))
+        if self.transport_errors:
+            self.transport_errors -= 1
+            raise httpx.ConnectError("connection lost")
+        status = self.statuses.pop(0) if self.statuses else 200
+        challenge = (
+            {
+                "Www-Authenticate": 'Bearer realm="https://auth.example/token",service="reg"'
+            }
+            if status == 401
+            else {}
+        )
+        yield httpx.Response(
+            status,
+            headers=challenge,
+            content=b"blob-bytes",
+            request=httpx.Request(method, url),
+        )
+
+    async def request(
+        self, url, method="GET", data=None, headers=None, json=None, params=None
+    ):
+        if "auth.example" in url:
+            return httpx.Response(200, json={"token": "a-token"})
+        return await super().request(
+            url, method, data=data, headers=headers, json=json, params=params
+        )
+
+
+async def download(transport, tmp_path, backend="token", setup=None):
+    registry = AsyncRegistry(
+        hostname="registry.example",
+        insecure=True,
+        auth_backend=backend,
+        transport=transport,  # type: ignore[arg-type]
+    )
+    if setup:
+        setup(registry)
+    container = registry.get_container("registry.example/demo/artifact:v1")
+    outfile = str(tmp_path / "blob.bin")
+    await registry.download_blob(container, "sha256:" + "a" * 64, outfile)
+    return outfile
+
+
+def authorizations(transport):
+    return [opened.get("Authorization", None) for opened in transport.opened]
+
+
+@pytest.mark.asyncio
+async def test_download_answers_a_token_challenge(tmp_path):
+    """
+    A download is authenticated like any other request, not left to fail.
+    """
+    transport = StreamingTransport([401, 200])
+
+    outfile = await download(transport, tmp_path)
+
+    assert authorizations(transport) == [None, "Bearer a-token"]
+    assert pathlib.Path(outfile).read_bytes() == b"blob-bytes"
+
+
+@pytest.mark.asyncio
+async def test_download_answers_a_basic_challenge(tmp_path):
+    transport = StreamingTransport([401, 200])
+
+    await download(
+        transport,
+        tmp_path,
+        backend="basic",
+        setup=lambda r: r.auth.set_basic_auth("myuser", "mypass"),
+    )
+
+    assert authorizations(transport)[1].startswith("Basic ")
+
+
+@pytest.mark.asyncio
+async def test_download_refreshes_after_a_403(tmp_path):
+    """
+    A token scoped too narrowly for the blob endpoint gets another chance.
+    """
+    transport = StreamingTransport([401, 403, 200])
+
+    await download(transport, tmp_path)
+
+    assert len(transport.opened) == 3
+
+
+@pytest.mark.asyncio
+async def test_download_reuses_a_token_it_already_holds(tmp_path):
+    transport = StreamingTransport([200])
+    registry = AsyncRegistry(
+        hostname="registry.example",
+        insecure=True,
+        transport=transport,  # type: ignore[arg-type]
+    )
+    registry.auth.token = "held-token"
+    container = registry.get_container("registry.example/demo/artifact:v1")
+
+    await registry.download_blob(
+        container, "sha256:" + "a" * 64, str(tmp_path / "blob.bin")
+    )
+
+    assert authorizations(transport) == ["Bearer held-token"]
+
+
+@pytest.mark.asyncio
+async def test_download_retries_a_failed_connection(tmp_path, monkeypatch):
+    monkeypatch.setattr(oras.decorator, "backoff_seconds", lambda attempt, timeout: 0)
+    transport = StreamingTransport([200], transport_errors=2)
+
+    outfile = await download(transport, tmp_path)
+
+    assert len(transport.opened) == 3, "two failures, then a success"
+    assert pathlib.Path(outfile).read_bytes() == b"blob-bytes"
+
+
+@pytest.mark.asyncio
+async def test_download_does_not_retry_a_status_the_registry_meant(tmp_path):
+    """
+    A 404 says the same thing however many times it is asked.
+    """
+    transport = StreamingTransport([404])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await download(transport, tmp_path)
+
+    assert len(transport.opened) == 1
