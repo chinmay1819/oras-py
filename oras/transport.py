@@ -86,7 +86,7 @@ class Transport:
         return self.session.request(
             method,
             url,
-            data=data,
+            data=resolve_body(data),
             json=json,
             headers=headers,
             stream=stream,
@@ -117,6 +117,24 @@ def response_reason(response) -> str:
     """
     reason = getattr(response, "reason", None) or getattr(response, "reason_phrase", "")
     return str(reason or "")
+
+
+def resolve_body(data):
+    """
+    Produce the body to send for one attempt at a request.
+
+    A request is sent more than once more often than it looks: to answer an
+    authentication challenge, to refresh a token after a 403, when the retry
+    decorator tries again, and when the client follows a redirect. A body that
+    can only be read once - an iterator over a file - is empty on every attempt
+    after the first, while Content-Length and the digest still describe the
+    first. Callers with such a body pass a callable producing a fresh one, and
+    it is resolved here, at the moment of sending. Re-readable bodies are
+    passed through untouched.
+
+    :param data: the body, or a callable returning a fresh body
+    """
+    return data() if callable(data) else data
 
 
 def successful_response(status_code: int = 200) -> requests.Response:

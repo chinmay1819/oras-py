@@ -128,7 +128,7 @@ class AsyncRegistry(RegistryBase):
         response = await self.transport.request(
             url,
             method,
-            data=self._request_body(data),
+            data=data,
             headers=headers,
             json=json,
             params=params,
@@ -144,7 +144,7 @@ class AsyncRegistry(RegistryBase):
         response = await self.transport.request(
             url,
             method,
-            data=self._request_body(data),
+            data=data,
             headers=headers,
             json=json,
             params=params,
@@ -158,7 +158,7 @@ class AsyncRegistry(RegistryBase):
             response = await self.transport.request(
                 url,
                 method,
-                data=self._request_body(data),
+                data=data,
                 headers=headers,
                 json=json,
                 params=params,

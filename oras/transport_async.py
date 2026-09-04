@@ -16,6 +16,8 @@ __license__ = "Apache-2.0"
 
 from typing import TYPE_CHECKING, Any, AsyncIterator, Optional, Union
 
+from oras.transport import resolve_body
+
 if TYPE_CHECKING:
     import httpx
 
@@ -116,16 +118,62 @@ class AsyncTransport:
         :param params: query string parameters to add to the url
         :type params: dict
         """
-        response = await self.client.request(
-            method,
-            url,
-            headers=headers,
-            json=json,
-            params=params,
-            **self._content_arguments(data),
-        )
+        # httpx cannot replay a body it has already streamed, so when the body
+        # can be produced again this follows the redirect itself, with a fresh
+        # body each hop. Anything re-readable is left to httpx as usual.
+        if callable(data):
+            response = await self._request_following_redirects(
+                url, method, data, headers, json, params
+            )
+        else:
+            response = await self.client.request(
+                method,
+                url,
+                headers=headers,
+                json=json,
+                params=params,
+                **self._content_arguments(data),
+            )
         self._forget_cookies()
         return response
+
+    async def _request_following_redirects(
+        self, url, method, data, headers, json, params, max_redirects: int = 5
+    ):
+        """
+        Send a request whose body can be produced again, following redirects.
+
+        Registries backed by object storage redirect blob uploads, and httpx
+        raises StreamConsumed if it has to replay a streamed body. Each hop
+        therefore asks for the body again rather than reusing a spent one.
+
+        Only 307 and 308 are followed, because they are the redirects that keep
+        the method and the body; anything else is returned for the caller to
+        interpret, as httpx would when a redirect changes the request.
+        """
+        for _ in range(max_redirects):
+            response = await self.client.request(
+                method,
+                url,
+                headers=headers,
+                json=json,
+                params=params,
+                follow_redirects=False,
+                **self._content_arguments(resolve_body(data)),
+            )
+            if response.status_code not in (307, 308):
+                return response
+
+            location = response.headers.get("location")
+            if not location:
+                return response
+
+            url = str(response.request.url.join(location))
+
+            # the query is carried by the new location from here on
+            params = None
+
+        raise ValueError(f"Too many redirects uploading to {url}")
 
     def stream(
         self,

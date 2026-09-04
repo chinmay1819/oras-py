@@ -11,7 +11,7 @@ import oras.auth
 import oras.auth.utils as auth_utils
 import oras.defaults
 import oras.provider
-from oras.transport import Transport, successful_response
+from oras.transport import Transport, resolve_body, successful_response
 
 
 def make_response(status_code: int = 200, content: bytes = b"", headers=None):
@@ -432,29 +432,26 @@ def test_token_request_returns_nothing_when_refused():
     assert backend.request_token(header) is None
 
 
-def test_do_request_resolves_a_callable_body_for_each_attempt():
-    """
-    A body that can only be read once is produced again when the request is
-    re-sent to answer an authentication challenge.
-    """
-    challenge = make_response(401, headers={"Www-Authenticate": 'Basic realm="r"'})
-    transport = FakeTransport([challenge, make_response(200)])
-    registry = oras.provider.Registry(
-        hostname="registry.example",
-        insecure=True,
-        auth_backend="basic",
-        transport=transport,
-    )
-    registry.auth.set_basic_auth("myuser", "mypass")
-
+def test_resolve_body_produces_a_fresh_body_for_each_attempt():
     produced = []
 
-    def body():
-        produced.append(b"payload")
-        return b"payload"
+    def factory():
+        produced.append(len(produced))
+        return b"fresh"
 
-    registry.do_request("http://registry.example/v2/", "PUT", data=body)
+    assert resolve_body(b"raw") == b"raw"
+    assert resolve_body({"a": "b"}) == {"a": "b"}
+    assert resolve_body(None) is None
+    assert resolve_body(factory) == b"fresh"
+    assert resolve_body(factory) == b"fresh"
+    assert produced == [0, 1], "a callable body is produced again for each send"
 
-    assert len(transport.calls) == 2
-    assert [call["data"] for call in transport.calls] == [b"payload", b"payload"]
-    assert produced == [b"payload", b"payload"], "body produced once per attempt"
+
+def test_transport_resolves_a_callable_body_at_the_send():
+    session = FakeSession()
+    transport = Transport(session=session)
+
+    transport.request("https://registry.example/v2/", "PUT", data=lambda: b"payload")
+    transport.request("https://registry.example/v2/", "PUT", data=lambda: b"payload")
+
+    assert [call["data"] for call in session.calls] == [b"payload", b"payload"]
