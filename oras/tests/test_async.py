@@ -491,7 +491,9 @@ async def test_async_missing_manifest_raises_value_error(registry, credentials):
 
 
 async def drain(body):
-    """Read a body the way a real transport would."""
+    """Resolve and read a body the way a real transport would."""
+    if callable(body):
+        body = body()
     if body is None:
         return b""
     if isinstance(body, (bytes, bytearray)):
@@ -601,19 +603,76 @@ async def test_upload_body_survives_a_retry(tmp_path, monkeypatch):
     assert transport.bodies == [payload, payload]
 
 
-def test_request_body_resolves_callables_and_passes_the_rest_through():
-    registry = get_registry()
+# ---------------------------------------------------------------- redirects
 
-    assert registry._request_body(b"raw") == b"raw"
-    assert registry._request_body({"a": "b"}) == {"a": "b"}
-    assert registry._request_body(None) is None
 
-    produced = []
+class RedirectingServer:
+    """
+    A real HTTP server that redirects the first PUT, and records each body.
 
-    def factory():
-        produced.append(len(produced))
-        return b"fresh"
+    This is deliberately not a fake transport: the bug it guards against lives
+    inside httpx's own redirect handling, below where a fake would sit.
+    """
 
-    assert registry._request_body(factory) == b"fresh"
-    assert registry._request_body(factory) == b"fresh"
-    assert produced == [0, 1], "a callable body is produced again for each attempt"
+    def __init__(self, redirect_status=307):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        self.received = []
+        received = self.received
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_PUT(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                received.append((self.path, body))
+                if self.path.endswith("/first"):
+                    self.send_response(redirect_status)
+                    self.send_header("Location", "/second")
+                else:
+                    self.send_response(201)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+
+    def __enter__(self):
+        import threading
+
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *args):
+        self.server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_streamed_body_survives_a_redirect():
+    """
+    Registries backed by object storage redirect blob uploads, and httpx
+    cannot replay a body it has already streamed. Each hop must get a fresh one.
+    """
+    payload = b"hello world"
+
+    with RedirectingServer() as server:
+        transport = AsyncTransport()
+        try:
+            response = await transport.request(
+                f"http://127.0.0.1:{server.port}/first",
+                "PUT",
+                data=lambda: iter_bytes(payload),
+                headers={"Content-Length": str(len(payload))},
+            )
+        finally:
+            await transport.aclose()
+
+    assert response.status_code == 201
+    assert [path for path, _ in server.received] == ["/first", "/second"]
+    assert [body for _, body in server.received] == [payload, payload]
+
+
+async def iter_bytes(payload: bytes):
+    yield payload

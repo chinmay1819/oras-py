@@ -88,22 +88,6 @@ class RegistryBase:
     def __str__(self) -> str:
         return "[oras-client]"
 
-    def _request_body(self, data):
-        """
-        Produce the body to send for one attempt at a request.
-
-        A request can be sent more than once: to answer an authentication
-        challenge, to refresh a token after a 403, or because the retry
-        decorator tried again. A body that can only be read once - a file
-        object, or an iterator over a file - is empty by the second attempt,
-        while Content-Length and the digest still describe the first. Callers
-        with such a body pass a callable that produces a fresh one, and it is
-        invoked per attempt. Anything re-readable is passed through untouched.
-
-        :param data: the body, or a callable returning a fresh body
-        """
-        return data() if callable(data) else data
-
     def _url(self, path: str) -> str:
         """
         Prefix a registry path (e.g., from a Container) with the scheme in use.
@@ -1266,7 +1250,7 @@ class Registry(RegistryBase):
         response = self.transport.request(
             url,
             method,
-            data=self._request_body(data),
+            data=data,
             headers=headers,
             json=json,
             stream=stream,
@@ -1283,7 +1267,7 @@ class Registry(RegistryBase):
         response = self.transport.request(
             url,
             method,
-            data=self._request_body(data),
+            data=data,
             headers=headers,
             json=json,
             stream=stream,
@@ -1297,7 +1281,7 @@ class Registry(RegistryBase):
             response = self.transport.request(
                 url,
                 method,
-                data=self._request_body(data),
+                data=data,
                 headers=headers,
                 json=json,
                 stream=stream,
