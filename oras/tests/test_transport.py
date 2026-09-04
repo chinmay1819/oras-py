@@ -430,3 +430,31 @@ def test_token_request_returns_nothing_when_refused():
     header = auth_utils.parse_auth_header('Bearer realm="https://auth.example/token"')
 
     assert backend.request_token(header) is None
+
+
+def test_do_request_resolves_a_callable_body_for_each_attempt():
+    """
+    A body that can only be read once is produced again when the request is
+    re-sent to answer an authentication challenge.
+    """
+    challenge = make_response(401, headers={"Www-Authenticate": 'Basic realm="r"'})
+    transport = FakeTransport([challenge, make_response(200)])
+    registry = oras.provider.Registry(
+        hostname="registry.example",
+        insecure=True,
+        auth_backend="basic",
+        transport=transport,
+    )
+    registry.auth.set_basic_auth("myuser", "mypass")
+
+    produced = []
+
+    def body():
+        produced.append(b"payload")
+        return b"payload"
+
+    registry.do_request("http://registry.example/v2/", "PUT", data=body)
+
+    assert len(transport.calls) == 2
+    assert [call["data"] for call in transport.calls] == [b"payload", b"payload"]
+    assert produced == [b"payload", b"payload"], "body produced once per attempt"

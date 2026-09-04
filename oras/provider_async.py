@@ -109,7 +109,9 @@ class AsyncRegistry(RegistryBase):
         :type url: str
         :param method: the method to use (GET, DELETE, POST, PUT, PATCH)
         :type method: str
-        :param data: body for the request
+        :param data: body for the request. A body that can only be read
+                     once must be given as a callable returning a fresh
+                     one, since the request may be sent again
         :param headers: headers for the request
         :type headers: dict
         :param json: json data for the request
@@ -124,7 +126,12 @@ class AsyncRegistry(RegistryBase):
         if isinstance(self.auth, oras.auth.TokenAuth) and self.auth.token is not None:
             headers.update(self.auth.get_auth_header())
         response = await self.transport.request(
-            url, method, data=data, headers=headers, json=json, params=params
+            url,
+            method,
+            data=self._request_body(data),
+            headers=headers,
+            json=json,
+            params=params,
         )
 
         # A 401 response is a request for authentication, 404 is not found
@@ -135,7 +142,12 @@ class AsyncRegistry(RegistryBase):
         if not changed:
             raise ValueError("Cannot respond to request for authentication.")
         response = await self.transport.request(
-            url, method, data=data, headers=headers, json=json, params=params
+            url,
+            method,
+            data=self._request_body(data),
+            headers=headers,
+            json=json,
+            params=params,
         )
 
         # One retry if 403 denied (need new token?)
@@ -144,7 +156,12 @@ class AsyncRegistry(RegistryBase):
                 response, headers, refresh=True
             )
             response = await self.transport.request(
-                url, method, data=data, headers=headers, json=json, params=params
+                url,
+                method,
+                data=self._request_body(data),
+                headers=headers,
+                json=json,
+                params=params,
             )
 
         return response
@@ -343,11 +360,14 @@ class AsyncRegistry(RegistryBase):
         )
 
         # An iterator keeps the blob out of memory. Content-Length is set from
-        # the layer, so the registry still gets a sized request.
+        # the layer, so the registry still gets a sized request. It is passed
+        # as a callable because an iterator is spent once it has been read, and
+        # this request is re-sent to answer an authentication challenge or by
+        # the retry decorator - each attempt needs to read the file again.
         return await self.do_request(
             blob_url,
             method="PUT",
-            data=iter_file(blob, oras.defaults.default_blocksize),
+            data=lambda: iter_file(blob, oras.defaults.default_blocksize),
             headers=headers,
         )
 

@@ -16,6 +16,7 @@ import pytest
 
 import oras.auth.utils
 import oras.client
+import oras.decorator
 import oras.defaults
 import oras.layout
 import oras.provider
@@ -484,3 +485,135 @@ async def test_async_missing_manifest_raises_value_error(registry, credentials):
     async with AsyncRegistry(hostname=registry, insecure=True) as client:
         with pytest.raises(ValueError):
             await client.get_manifest(f"{registry}/dinosaur/does-not-exist:v1")
+
+
+# ---------------------------------------------------------------- resent bodies
+
+
+async def drain(body):
+    """Read a body the way a real transport would."""
+    if body is None:
+        return b""
+    if isinstance(body, (bytes, bytearray)):
+        return bytes(body)
+    chunks = []
+    async for chunk in body:
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+class BodyRecordingTransport(FakeAsyncTransport):
+    """
+    Reads each body, as a real transport does, and records what arrived.
+
+    Reading matters: a body that can only be read once looks fine until
+    something reads it twice.
+    """
+
+    def __init__(self, responses=None, fail_first=False):
+        super().__init__(responses)
+        self.bodies = []
+        self.fail_first = fail_first
+        self.sent = 0
+
+    async def request(
+        self, url, method="GET", data=None, headers=None, json=None, params=None
+    ):
+        body = await drain(data)
+        if method == "PUT":
+            self.bodies.append(body)
+            self.sent += 1
+            if self.fail_first and self.sent == 1:
+                raise httpx.ConnectError("boom")
+        return await super().request(
+            url, method, data=data, headers=headers, json=json, params=params
+        )
+
+
+def upload_layer(payload: bytes) -> dict:
+    return {
+        "digest": digest_of(payload),
+        "size": len(payload),
+        "mediaType": "application/octet-stream",
+    }
+
+
+def blob_file(tmp_path, payload: bytes) -> str:
+    path = tmp_path / "blob.bin"
+    path.write_bytes(payload)
+    return str(path)
+
+
+@pytest.mark.asyncio
+async def test_upload_body_survives_an_authentication_challenge(tmp_path):
+    """
+    The blob PUT is re-sent to answer a 401, and must carry the same bytes.
+
+    A body read straight from disk is spent after the first send, which would
+    leave the retry declaring a Content-Length and digest for content it did
+    not actually send.
+    """
+    payload = b"hello world"
+    session = httpx.Response(
+        202, headers={"location": "http://registry.example/v2/demo/blobs/uploads/1"}
+    )
+    challenge = httpx.Response(
+        401,
+        headers={
+            "Www-Authenticate": 'Bearer realm="https://auth.example/token",service="registry.example"'
+        },
+    )
+    token = httpx.Response(200, json={"token": "a-token"})
+    transport = BodyRecordingTransport([session, challenge, token, httpx.Response(201)])
+    registry = get_registry(transport)
+    container = registry.get_container("registry.example/demo/artifact:v1")
+
+    await registry.put_upload(
+        blob_file(tmp_path, payload), container, upload_layer(payload)
+    )
+
+    assert len(transport.bodies) == 2, "expected the PUT to be sent twice"
+    assert transport.bodies == [payload, payload]
+
+
+@pytest.mark.asyncio
+async def test_upload_body_survives_a_retry(tmp_path, monkeypatch):
+    """
+    The same holds when the retry decorator re-sends after a failure.
+    """
+    monkeypatch.setattr(oras.decorator, "backoff_seconds", lambda attempt, timeout: 0)
+
+    payload = b"retried payload"
+    session = httpx.Response(
+        202, headers={"location": "http://registry.example/v2/demo/blobs/uploads/1"}
+    )
+    transport = BodyRecordingTransport(
+        [session, session, httpx.Response(201)], fail_first=True
+    )
+    registry = get_registry(transport)
+    container = registry.get_container("registry.example/demo/artifact:v1")
+
+    await registry.put_upload(
+        blob_file(tmp_path, payload), container, upload_layer(payload)
+    )
+
+    assert len(transport.bodies) == 2, "expected the PUT to be sent twice"
+    assert transport.bodies == [payload, payload]
+
+
+def test_request_body_resolves_callables_and_passes_the_rest_through():
+    registry = get_registry()
+
+    assert registry._request_body(b"raw") == b"raw"
+    assert registry._request_body({"a": "b"}) == {"a": "b"}
+    assert registry._request_body(None) is None
+
+    produced = []
+
+    def factory():
+        produced.append(len(produced))
+        return b"fresh"
+
+    assert registry._request_body(factory) == b"fresh"
+    assert registry._request_body(factory) == b"fresh"
+    assert produced == [0, 1], "a callable body is produced again for each attempt"
