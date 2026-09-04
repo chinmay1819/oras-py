@@ -14,6 +14,7 @@ and **Merged pull requests**. Critical items to know are:
 The versions coincide with releases on pip. Only major versions will be released as tags on Github.
 
 ## [0.0.x](https://github.com/oras-project/oras-py/tree/main) (0.0.x)
+ - answer an authentication challenge when downloading a blob asynchronously, and retry a failed connection, so a streamed download is authenticated like every other request (0.2.49)
  - resolve a request body at the moment it is sent, so an asynchronous blob upload that is redirected by the registry re-reads the file instead of failing on a spent stream (0.2.48)
  - fix the asynchronous blob upload sending an empty body when the request is retried: a body that can only be read once is now produced again for each attempt (0.2.47)
  - add an asynchronous client, `oras.client.AsyncOrasClient`, backed by httpx through the new `async` extra. Registry decisions move to a shared `RegistryBase` so the synchronous and asynchronous providers share them rather than each holding a copy (0.2.46)
