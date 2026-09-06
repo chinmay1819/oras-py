@@ -3,8 +3,10 @@ __copyright__ = "Copyright The ORAS Authors."
 __license__ = "Apache-2.0"
 
 import asyncio
+import ssl
 import time
 from functools import wraps
+from typing import Optional
 
 import requests.exceptions
 
@@ -31,6 +33,29 @@ def check_5xx(res):
         except Exception:
             pass
         raise ValueError(f"Issue with {res.request.url}: {response_reason(res)}")
+
+
+def is_certificate_error(error: BaseException) -> bool:
+    """
+    Whether a failure is a TLS problem rather than something transient.
+
+    requests raises a distinct SSLError, which the synchronous retry re-raises
+    at once: a bad certificate or the wrong hostname will not fix itself, and
+    sleeping through the attempts only delays the message. httpx has no such
+    class - a certificate failure and a refused connection are both a
+    ConnectError - so the cause chain is what tells them apart. A refused
+    connection is still worth retrying; a certificate is not.
+
+    :param error: the exception a request raised
+    """
+    seen = set()
+    cause: Optional[BaseException] = error
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, ssl.SSLError):
+            return True
+        cause = cause.__cause__ or cause.__context__
+    return False
 
 
 def backoff_seconds(attempt: int, timeout: int) -> int:
@@ -118,6 +143,12 @@ def retry_async(attempts=5, timeout=2):
                 except ImportError:
                     raise
                 except Exception as e:
+                    # httpx reports a bad certificate as an ordinary
+                    # ConnectError, so it has to be recognised rather than
+                    # caught by class, or it would sleep through every attempt
+                    # before the user is told the certificate is wrong.
+                    if is_certificate_error(e):
+                        raise
                     sleep = backoff_seconds(attempt, timeout)
                     logger.info(f"Retrying in {sleep} seconds - error: {e}")
                     await asyncio.sleep(sleep)

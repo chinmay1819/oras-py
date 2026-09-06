@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import os
 import pathlib
+import ssl
 from contextlib import asynccontextmanager
 
 import pytest
@@ -825,3 +826,75 @@ async def test_download_does_not_retry_a_status_the_registry_meant(tmp_path):
         await download(transport, tmp_path)
 
     assert len(transport.opened) == 1
+
+
+# ---------------------------------------------------------------- retry policy
+
+
+def ssl_backed_connect_error():
+    """
+    A ConnectError shaped the way httpx reports a bad certificate.
+    """
+    error = httpx.ConnectError("connection failed")
+    error.__cause__ = ssl.SSLCertVerificationError("certificate verify failed")
+    return error
+
+
+def test_a_certificate_failure_is_recognised_through_the_cause_chain():
+    """
+    httpx reports a bad certificate and a refused connection the same way, so
+    only the cause tells them apart.
+    """
+    assert oras.decorator.is_certificate_error(ssl_backed_connect_error()) is True
+
+    refused = httpx.ConnectError("connection failed")
+    refused.__cause__ = ConnectionRefusedError("refused")
+    assert oras.decorator.is_certificate_error(refused) is False
+
+    assert (
+        oras.decorator.is_certificate_error(ValueError("nothing to do with tls"))
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_async_does_not_retry_a_certificate_failure(monkeypatch):
+    """
+    A wrong certificate will not fix itself, so it is reported at once rather
+    than after every attempt has slept.
+    """
+    slept = []
+    monkeypatch.setattr(asyncio, "sleep", lambda n: slept.append(n))
+    attempts = []
+
+    @oras.decorator.retry_async(attempts=5, timeout=2)
+    async def failing():
+        attempts.append(1)
+        raise ssl_backed_connect_error()
+
+    with pytest.raises(httpx.ConnectError):
+        await failing()
+
+    assert len(attempts) == 1, "the request should be made once"
+    assert slept == [], "and nothing should be slept through"
+
+
+@pytest.mark.asyncio
+async def test_retry_async_still_retries_a_refused_connection(monkeypatch):
+    """
+    A refused connection may well succeed later, and is retried as before.
+    """
+    monkeypatch.setattr(oras.decorator, "backoff_seconds", lambda attempt, timeout: 0)
+    attempts = []
+
+    @oras.decorator.retry_async(attempts=3, timeout=2)
+    async def failing():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200)
+
+    response = await failing()
+
+    assert response.status_code == 200
+    assert len(attempts) == 3, "it should keep trying"
