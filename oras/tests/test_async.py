@@ -154,7 +154,7 @@ def test_transport_maps_bodies_onto_httpx_arguments():
     """
     requests takes bytes and forms through `data`, httpx separates them.
     """
-    transport = AsyncTransport(client=object())
+    transport = AsyncTransport(client=httpx.AsyncClient())
 
     assert transport._content_arguments(None) == {}
     assert transport._content_arguments(b"raw") == {"content": b"raw"}
@@ -898,3 +898,96 @@ async def test_retry_async_still_retries_a_refused_connection(monkeypatch):
 
     assert response.status_code == 200
     assert len(attempts) == 3, "it should keep trying"
+
+
+# ---------------------------------------------------------------- cookies
+
+
+class CookieServer:
+    """
+    A real server that sets a cookie on every response, and records what it
+    was sent. Registries that do this treat an accepted cookie as a sign they
+    are talking to a browser, and start asking for CSRF tokens.
+    """
+
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        self.received = []
+        received = self.received
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append((self.path, self.headers.get("Cookie")))
+                if self.path == "/redirect":
+                    self.send_response(307)
+                    self.send_header("Set-Cookie", "sid=from-redirect; Path=/")
+                    self.send_header("Location", "/after")
+                elif self.path == "/blob":
+                    self.send_response(200)
+                    self.send_header("Set-Cookie", "sid=from-blob; Path=/")
+                    self.send_header("Content-Length", "9")
+                    self.end_headers()
+                    self.wfile.write(b"blob-body")
+                    return
+                else:
+                    self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def __enter__(self):
+        import threading
+
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *args):
+        self.server.shutdown()
+
+    def cookies_sent(self):
+        return [cookie for _, cookie in self.received]
+
+
+@pytest.mark.asyncio
+async def test_a_cookie_from_a_streamed_response_is_refused():
+    """
+    Downloads are most of the traffic, and they stream, so a cookie set on one
+    must not be kept for later requests.
+    """
+    with CookieServer() as server:
+        transport = AsyncTransport()
+        try:
+            async with transport.stream(f"{server.url}/blob") as response:
+                async for _ in response.aiter_bytes():
+                    pass
+
+            assert list(transport.client.cookies.jar) == []
+
+            await transport.request(f"{server.url}/next")
+        finally:
+            await transport.aclose()
+
+    assert server.cookies_sent() == [None, None], "no cookie should be sent back"
+
+
+@pytest.mark.asyncio
+async def test_a_cookie_is_not_carried_across_a_redirect():
+    """
+    Refusing a cookie has to happen as the response is read, not afterwards,
+    or it is still sent on the next leg of the same request.
+    """
+    with CookieServer() as server:
+        transport = AsyncTransport()
+        try:
+            await transport.request(f"{server.url}/redirect")
+        finally:
+            await transport.aclose()
+
+    assert [path for path, _ in server.received] == ["/redirect", "/after"]
+    assert server.cookies_sent() == [None, None]

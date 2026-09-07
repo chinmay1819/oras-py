@@ -14,6 +14,7 @@ oras keeps working without it.
 __copyright__ = "Copyright The ORAS Authors."
 __license__ = "Apache-2.0"
 
+from http.cookiejar import DefaultCookiePolicy
 from typing import TYPE_CHECKING, Any, AsyncIterator, Optional, Union
 
 from oras.transport import resolve_body
@@ -68,16 +69,14 @@ class AsyncTransport:
             verify=tls_verify, follow_redirects=True
         )
 
-    def _forget_cookies(self):
-        """
-        Drop any cookies the registry tried to set.
-
-        Some registries take an accepted cookie as a sign they are talking to a
-        browser and start requiring CSRF tokens (Harbor is such a case). The
-        sync transport refuses cookies with a cookie policy; httpx has no
-        equivalent, so the jar is emptied instead.
-        """
-        self.client.cookies.clear()
+        # Ignore all cookies: some registries try to set one and take it as a
+        # sign they are talking to a browser, trying to set further CSRF
+        # cookies (Harbor is such a case). httpx keeps its cookies in a
+        # standard library jar, so it can refuse them with the same policy the
+        # sync transport uses. Refusing is what matters rather than clearing
+        # afterwards, which would leave a cookie in play for the rest of the
+        # request, redirects included, and would miss streamed responses.
+        self.client.cookies.jar.set_policy(DefaultCookiePolicy(allowed_domains=[]))
 
     def _content_arguments(self, data: Any) -> dict:
         """
@@ -134,7 +133,6 @@ class AsyncTransport:
                 params=params,
                 **self._content_arguments(data),
             )
-        self._forget_cookies()
         return response
 
     async def _request_following_redirects(
